@@ -1,5 +1,6 @@
 """Provide functionality to record stream."""
 
+import io
 import threading
 from typing import List
 
@@ -22,9 +23,15 @@ def recorder_save_worker(file_out: str, segments: List[Segment]):
     output_v = None
 
     for segment in segments:
+        # This means there is still incoming data on that segment,
+        # we don't want half finished segments so let's ignore this
+        if not segment.segment.is_closed():
+            continue
+
         # Seek to beginning and open segment
-        segment.segment.seek(0)
-        source = av.open(segment.segment, "r", format="mpegts")
+        recording_data = io.BytesIO(segment.segment.byte_array())
+        recording_data.seek(0)
+        source = av.open(recording_data, "r", format="mpegts")
         source_v = source.streams.video[0]
 
         # Add output streams
@@ -68,11 +75,6 @@ class RecorderOutput(StreamOutput):
     def format(self) -> str:
         """Return container format."""
         return "mpegts"
-
-    @property
-    def audio_codec(self) -> str:
-        """Return desired audio codec."""
-        return "aac"
 
     @property
     def video_codec(self) -> str:

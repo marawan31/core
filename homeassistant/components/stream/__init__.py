@@ -68,12 +68,15 @@ def request_stream(hass, stream_source, *, fmt="hls", keepalive=False, options=N
             stream.keepalive = keepalive
 
         # Add provider
-        stream.add_provider(fmt)
+        provider = stream.add_provider(fmt)
 
         if not stream.access_token:
             stream.access_token = secrets.token_hex()
             stream.start()
-        return hass.data[DOMAIN][ATTR_ENDPOINTS][fmt].format(stream.access_token)
+        start_sequence = provider.last_sequence + 1
+        return hass.data[DOMAIN][ATTR_ENDPOINTS][fmt].format(
+            stream.access_token, start_sequence
+        )
     except Exception:
         raise HomeAssistantError("Unable to get stream")
 

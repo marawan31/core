@@ -1,170 +1,284 @@
 """Provides the worker thread needed for processing streams."""
-from fractions import Fraction
-import io
 import logging
 
 import av
 
-from .const import AUDIO_SAMPLE_RATE
-from .core import Segment, StreamBuffer
+from .core import Segment, StreamBuffer, SwitchableBufferedStream
 
 _LOGGER = logging.getLogger(__name__)
 
 
-def generate_audio_frame():
-    """Generate a blank audio frame."""
-
-    audio_frame = av.AudioFrame(format="dbl", layout="mono", samples=1024)
-    # audio_bytes = b''.join(b'\x00\x00\x00\x00\x00\x00\x00\x00'
-    #                        for i in range(0, 1024))
-    audio_bytes = b"\x00\x00\x00\x00\x00\x00\x00\x00" * 1024
-    audio_frame.planes[0].update(audio_bytes)
-    audio_frame.sample_rate = AUDIO_SAMPLE_RATE
-    audio_frame.time_base = Fraction(1, AUDIO_SAMPLE_RATE)
-    return audio_frame
+def should_decode(audio_stream, stream_output):
+    """Returns whether or not we should decode the audio stream."""
+    return (
+        not audio_stream.name == stream_output.audio_codec
+        or not stream_output.is_audio_sample_rate_supported(audio_stream.rate)
+    )
 
 
-def create_stream_buffer(stream_output, video_stream, audio_frame):
+def create_stream_buffer(stream_output, video_stream, audio_stream):
     """Create a new StreamBuffer."""
 
-    a_packet = None
-    segment = io.BytesIO()
+    segment = SwitchableBufferedStream()
     output = av.open(segment, mode="w", format=stream_output.format)
+    astream = None
+    requires_audio_decode = False
     vstream = output.add_stream(template=video_stream)
     # Check if audio is requested
-    astream = None
-    if stream_output.audio_codec:
-        astream = output.add_stream(stream_output.audio_codec, AUDIO_SAMPLE_RATE)
-        # Need to do it multiple times for some reason
-        while not a_packet:
-            a_packets = astream.encode(audio_frame)
-            if a_packets:
-                a_packet = a_packets[0]
-    return (a_packet, StreamBuffer(segment, output, vstream, astream))
+    if (
+        audio_stream is not None
+        and stream_output.audio_codec is not None
+        and stream_output.preferred_audio_sample_rate is not None
+    ):
+        if should_decode(audio_stream, stream_output):
+            astream = output.add_stream(
+                codec_name=stream_output.audio_codec,
+                rate=stream_output.preferred_audio_sample_rate,
+            )
+            requires_audio_decode = True
+        else:
+            astream = output.add_stream(template=audio_stream)
+    return StreamBuffer(
+        segment,
+        output,
+        vstream,
+        astream,
+        requires_audio_decode,
+        stream_output.frangible,
+    )
+
+
+def update_outputs(
+    hass, outputs, stream, sequence, video_stream, audio_stream, target_duration
+):
+    """Updates the stream outputs."""
+    # To prevent dict modified during iteration
+    stream_output_keys = set(stream.outputs.keys())
+    for fmt in stream_output_keys:
+        stream_output = stream.outputs[fmt]
+        current_buffer = outputs.get(fmt)
+        create_buffer = True
+        if current_buffer is not None:
+            if current_buffer.frangible:
+                # Since the output supports simply switching buffers then
+                # we can simply switch the underlying buffer and continue writting
+                create_buffer = False
+                current_buffer.segment.switch_stream()
+            else:
+                # Close the buffer
+                current_buffer.output.close()
+                current_buffer.segment.close()
+
+        if create_buffer:
+            if video_stream.name != stream_output.video_codec:
+                continue
+            current_buffer = create_stream_buffer(
+                stream_output, video_stream, audio_stream
+            )
+            outputs[stream_output.name] = current_buffer
+        # Save segment to outputs
+        hass.loop.call_soon_threadsafe(
+            stream_output.put,
+            Segment(
+                sequence, current_buffer.segment.get_current_stream(), target_duration
+            ),
+        )
+
+    # Let's get the outputs that are no longer available and close/remove them
+    outputs_to_remove = set(outputs.keys()) - stream_output_keys
+    for fmt in outputs_to_remove:
+        outputs[fmt].output.close()
+        outputs[fmt].segment.close()
+        del outputs[fmt]
+
+
+def handle_audio_decode(buffer, audio_frames, recalculate_audio_pts, pts, time_base):
+    """Handle decoding the audio."""
+    for a_frame in audio_frames:
+        # Let avcodec decide of the pts
+        a_frame.pts = None
+        for a_packet in buffer.astream.encode(a_frame):
+            a_packet.stream = buffer.astream
+            # Let the avcodec decide of the next pts/dts
+            # By default it increments by duration which is what we want
+            a_packet.pts = None
+            a_packet.dts = None
+            if recalculate_audio_pts:
+                # We will attempt to recalculate the audio pts/dts.
+                # This will always happen on the first packet.
+                audio_pts = int(pts / a_packet.time_base * time_base)
+                recalculate_audio_pts = False
+                a_packet.pts = audio_pts
+                a_packet.dts = audio_pts
+            buffer.output.mux(a_packet)
+
+
+def stream_worker_writer(
+    hass, container, outputs, stream, quit_event, video_stream, audio_stream
+):
+    """Handle consuming streams."""
+
+    # Keep track of the number of segments we've processed
+    sequence = 1
+
+    # -----Video Section------
+    first_video_packet = True
+    # The presentation timestamp of the first video packet we receive
+    first_video_pts = 0
+    # The decoder timestamp of the latest video packet we processed
+    last_video_dts = None
+
+    # -----Audio Section------
+    first_audio_packet = True
+    # The presentation timestamp of the first audio packet we receive
+    first_audio_pts = 0
+    # The expect audio pts value
+    expected_audio_pts = None
+
+    while not quit_event.is_set():
+        packet = None
+        if audio_stream is not None:
+            packet = next(container.demux(video_stream, audio_stream))
+        else:
+            packet = next(container.demux(video_stream))
+
+        if packet is None:
+            raise StopIteration("Received none packet")
+
+        if packet.stream.type == "video":
+            if packet.dts is None:
+                if first_video_packet:
+                    continue
+                # If we get a "flushing" packet, the stream is done
+                raise StopIteration("No dts in packet")
+            if last_video_dts is not None and last_video_dts >= packet.dts:
+                continue
+            last_video_dts = packet.dts
+            if first_video_packet:
+                first_video_pts = packet.pts
+                first_video_packet = False
+
+            # Reset timestamps from a 0 time base for this video stream
+            packet.pts -= first_video_pts
+            packet.dts -= first_video_pts
+
+            if packet.is_keyframe:
+                # Calculate the segment duration by multiplying the presentation
+                # timestamp by the time base, which gets us total seconds.
+                # By then dividing by the sequence, we can calculate how long
+                # each segment is, assuming the stream starts from 0.
+                # Here we use 0.5 seconds as a fallback for the first segment.
+                segment_duration = (
+                    float((packet.pts * packet.time_base) / sequence) or 0.5
+                )
+                update_outputs(
+                    hass,
+                    outputs,
+                    stream,
+                    sequence,
+                    video_stream,
+                    audio_stream,
+                    segment_duration,
+                )
+                sequence += 1
+
+            for buffer in outputs.values():
+                if buffer.vstream:
+                    packet.stream = buffer.vstream
+                    buffer.output.mux(packet)
+        elif packet.stream.type == "audio":
+            if packet.dts is None:
+                if first_audio_packet:
+                    continue
+                # If we get a "flushing" packet, the stream is done
+                raise StopIteration("No dts in packet")
+            if first_video_packet:
+                # No need to send audio if we haven't received any video frames yet
+                continue
+            if first_audio_packet:
+                # Since we use the first video pts as our zero value then we need
+                # to calculate the audio starting pts using the video starting pts.
+                first_audio_pts = int(
+                    first_video_pts / packet.time_base * video_stream.time_base
+                )
+                first_audio_packet = False
+
+            # Reset timestamps from a 0 time base for this audio stream
+            packet.pts -= first_audio_pts
+            packet.dts -= first_audio_pts
+
+            # If we don't know what the expected pts is we need to calculate it
+            recalculate_pts = expected_audio_pts is None
+
+            if expected_audio_pts is not None and packet.pts != expected_audio_pts:
+                # If the pts isn't what we expected it's either ahead or behind the current stream
+                if expected_audio_pts < packet.pts:
+                    # Probably lost some audio packets or there is an audio gap
+                    # Let's recalculate our pts
+                    recalculate_pts = True
+                else:
+                    # Just drop that thing... makes no sense to go backwards for audio
+                    continue
+
+            # set our next expected pts
+            expected_audio_pts = packet.pts + packet.duration
+            audio_frames = None
+            for buffer in outputs.values():
+
+                # If the output doesn't support audio let's skip it
+                if buffer.astream is None:
+                    continue
+
+                # The output supports the incoming audio steram directly, no need to re-encode :)
+                if not buffer.requires_audio_decode:
+                    packet.stream = buffer.astream
+                    buffer.output.mux(packet)
+                    continue
+                # If the output is receiving the first ever audio frame we need to calculate the audio pts
+                recalculate_audio_pts = recalculate_pts or buffer.astream.frames == 0
+                if audio_frames is None:
+                    # Decode it once for all the outputs so that we don't do it on every iteration
+                    audio_frames = packet.decode()
+                handle_audio_decode(
+                    buffer,
+                    audio_frames,
+                    recalculate_audio_pts,
+                    packet.pts,
+                    packet.time_base,
+                )
 
 
 def stream_worker(hass, stream, quit_event):
     """Handle consuming streams."""
 
     container = av.open(stream.source, options=stream.options)
+    audio_stream = None
+    video_stream = None
     try:
         video_stream = container.streams.video[0]
     except (KeyError, IndexError):
         _LOGGER.error("Stream has no video")
         return
 
-    audio_frame = generate_audio_frame()
+    try:
+        audio_stream = container.streams.audio[0]
+    except (KeyError, IndexError):
+        _LOGGER.info("Stream has no audio")
 
-    first_packet = True
     # Holds the buffers for each stream provider
     outputs = {}
-    # Keep track of the number of segments we've processed
-    sequence = 1
-    # Holds the generated silence that needs to be muxed into the output
-    audio_packets = {}
-    # The presentation timestamp of the first video packet we receive
-    first_pts = 0
-    # The decoder timestamp of the latest packet we processed
-    last_dts = None
-
-    while not quit_event.is_set():
-        try:
-            packet = next(container.demux(video_stream))
-            if packet.dts is None:
-                if first_packet:
-                    continue
-                # If we get a "flushing" packet, the stream is done
-                raise StopIteration("No dts in packet")
-        except (av.AVError, StopIteration) as ex:
-            # End of stream, clear listeners and stop thread
-            for fmt, _ in outputs.items():
-                hass.loop.call_soon_threadsafe(stream.outputs[fmt].put, None)
-            _LOGGER.error("Error demuxing stream: %s", str(ex))
-            break
-
-        # Skip non monotonically increasing dts in feed
-        if not first_packet and last_dts >= packet.dts:
-            continue
-        last_dts = packet.dts
-
-        # Reset timestamps from a 0 time base for this stream
-        packet.dts -= first_pts
-        packet.pts -= first_pts
-
-        # Reset segment on every keyframe
-        if packet.is_keyframe:
-            # Calculate the segment duration by multiplying the presentation
-            # timestamp by the time base, which gets us total seconds.
-            # By then dividing by the sequence, we can calculate how long
-            # each segment is, assuming the stream starts from 0.
-            segment_duration = (packet.pts * packet.time_base) / sequence
-            # Save segment to outputs
-            for fmt, buffer in outputs.items():
-                buffer.output.close()
-                del audio_packets[buffer.astream]
-                if stream.outputs.get(fmt):
-                    hass.loop.call_soon_threadsafe(
-                        stream.outputs[fmt].put,
-                        Segment(sequence, buffer.segment, segment_duration),
-                    )
-
-            # Clear outputs and increment sequence
-            outputs = {}
-            if not first_packet:
-                sequence += 1
-
-            # Initialize outputs
-            for stream_output in stream.outputs.values():
-                if video_stream.name != stream_output.video_codec:
-                    continue
-
-                a_packet, buffer = create_stream_buffer(
-                    stream_output, video_stream, audio_frame
-                )
-                audio_packets[buffer.astream] = a_packet
-                outputs[stream_output.name] = buffer
-
-        # First video packet tends to have a weird dts/pts
-        if first_packet:
-            # If we are attaching to a live stream that does not reset
-            # timestamps for us, we need to do it ourselves by recording
-            # the first presentation timestamp and subtracting it from
-            # subsequent packets we receive.
-            if (packet.pts * packet.time_base) > 1:
-                first_pts = packet.pts
-            packet.dts = 0
-            packet.pts = 0
-            first_packet = False
-
-        # Store packets on each output
+    try:
+        stream_worker_writer(
+            hass, container, outputs, stream, quit_event, video_stream, audio_stream
+        )
+    except (StopIteration, av.AVError) as ex:
+        _LOGGER.error("Error demuxing stream: %s", str(ex))
+    finally:
+        # Let's close everything
         for buffer in outputs.values():
-            # Check if the format requires audio
-            if audio_packets.get(buffer.astream):
-                a_packet = audio_packets[buffer.astream]
-                a_time_base = a_packet.time_base
-
-                # Determine video start timestamp and duration
-                video_start = packet.pts * packet.time_base
-                video_duration = packet.duration * packet.time_base
-
-                if packet.is_keyframe:
-                    # Set first audio packet in sequence to equal video pts
-                    a_packet.pts = int(video_start / a_time_base)
-                    a_packet.dts = int(video_start / a_time_base)
-
-                # Determine target end timestamp for audio
-                target_pts = int((video_start + video_duration) / a_time_base)
-                while a_packet.pts < target_pts:
-                    # Mux audio packet and adjust points until target hit
-                    buffer.output.mux(a_packet)
-                    a_packet.pts += a_packet.duration
-                    a_packet.dts += a_packet.duration
-                    audio_packets[buffer.astream] = a_packet
-
-            # Assign the video packet to the new stream & mux
-            packet.stream = buffer.vstream
-            buffer.output.mux(packet)
-
-    # Close stream
-    buffer.output.close()
-    container.close()
+            buffer.output.close()
+            buffer.segment.close()
+        stream_output_keys = set(stream.outputs.keys())
+        for key in stream_output_keys:
+            hass.loop.call_soon_threadsafe(stream.outputs[key].put, None)
+        container.close()
