@@ -64,7 +64,11 @@ class HlsSegmentView(StreamView):
 
         # This is where the magic happens
         # We send the data as it is ready, which means we can fill the buffer while the client is requesting it.
-        # This gives minimal latency between the stream and "real life".
+        # This gives minimal latency between the stream and "real life" since the player can start downloading
+        # the data before we fully complete it.
+        # Eventhough this helps, latency will still not be the best since hls.js doesn't support LHLS (low latency HLS) yet.
+        # For more info on LHLS support in hls.js: https://github.com/video-dev/hls.js/pull/2370
+        # The forked jwplayer of hls.js does support LHLS on one of the branches.
         for data in segment.segment.data():
             # This is important because we will never yield if the client can read as much as the server writes.
             # This is a known aiohttp design decision.

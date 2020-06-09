@@ -92,7 +92,9 @@ def update_outputs(
         del outputs[fmt]
 
 
-def handle_audio_decode(buffer, audio_frames, recalculate_audio_pts, pts, time_base):
+def handle_audio_decode(
+    buffer, audio_frames, recalculate_audio_pts, starting_pts, time_base
+):
     """Handle decoding the audio."""
     for a_frame in audio_frames:
         # Let avcodec decide of the pts
@@ -106,7 +108,7 @@ def handle_audio_decode(buffer, audio_frames, recalculate_audio_pts, pts, time_b
             if recalculate_audio_pts:
                 # We will attempt to recalculate the audio pts/dts.
                 # This will always happen on the first packet.
-                audio_pts = int(pts / a_packet.time_base * time_base)
+                audio_pts = int(starting_pts / a_packet.time_base * time_base)
                 recalculate_audio_pts = False
                 a_packet.pts = audio_pts
                 a_packet.dts = audio_pts
@@ -234,6 +236,7 @@ def stream_worker_writer(
                     packet.stream = buffer.astream
                     buffer.output.mux(packet)
                     continue
+
                 # If the output is receiving the first ever audio frame we need to calculate the audio pts
                 recalculate_audio_pts = recalculate_pts or buffer.astream.frames == 0
                 if audio_frames is None:

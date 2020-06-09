@@ -73,7 +73,9 @@ def request_stream(hass, stream_source, *, fmt="hls", keepalive=False, options=N
         if not stream.access_token:
             stream.access_token = secrets.token_hex()
             stream.start()
-        start_sequence = provider.last_sequence + 1
+        # When we request a stream we should start from the last sequence to be
+        # near "real life" stream.
+        start_sequence = provider.last_sequence
         return hass.data[DOMAIN][ATTR_ENDPOINTS][fmt].format(
             stream.access_token, start_sequence
         )
